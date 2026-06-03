@@ -414,7 +414,7 @@ function normHeader(v){
     .replace(/\s+/g, '_');
 }
 function cleanText(v){
-  let s = String(v ?? '').replace(/\u0000/g, '').replace(/\uFFFD/g, '').trim();
+  let s = String(v ?? '').replace(/\u0000/g, '').replace(/\uFFFD/g, '').replace(/\uFEFF/g, '').trim();
   if (!s) return '';
   const fixes = [
     [/Ã¡/g,'á'],[/Ã /g,'à'],[/Ã¢/g,'â'],[/Ã£/g,'ã'],[/Ã©/g,'é'],[/Ãê/g,'ê'],
@@ -543,12 +543,16 @@ async function readFile(file, key){
   // quebras de linha e a estrutura do CSV/TXT.
   text = String(text).replace(/^\uFEFF/, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 
-  const delimiter = detectDelimiter(text, key === 'stage' ? ';' : undefined);
+  const delimiter = detectDelimiter(text, (key === 'stage' || key === 'velox') ? ';' : undefined);
   const lines = text.split('\n').filter(l => l.trim() !== '');
   if (!lines.length) throw new Error('Arquivo vazio ou encoding não reconhecido.');
 
-  const aoa = lines.map(line =>
-    splitDelimitedLine(line, delimiter).map(v => cleanText(v))
+  const aoa = lines.map((line, li) =>
+    splitDelimitedLine(line, delimiter).map((v, ci) => {
+      // Strip BOM from first cell of first row (Velox CSV artifact)
+      if (li === 0 && ci === 0) v = String(v).replace(/^\uFEFF/, '');
+      return cleanText(v);
+    })
   );
   if (!aoa.length || !aoa.some(r => r.some(c => String(c ?? '').trim() !== ''))) {
     throw new Error('Não foi possível ler o conteúdo do arquivo.');
@@ -665,6 +669,71 @@ function finishDays(days){
 
 
 
+// ── Agenda de Separação CD 107 ──────────────────────────────────────────────
+// Mapa: slot de agenda → lojas que saem naquele dia
+const CD107_SLOTS = {
+  DOM: [1,8,20,28,30,31,33,36,41,46,49,50,58,90],
+  SEG: [1,2,8,9,12,16,21,32,38,39,40,42,48,54,63,85,95],
+  TER: [5,18,23,26,27,43,44,47,53,56,57,59,70],
+  QUA: [19,22,24,34,35,37,45,51,55,65,75,80],
+  QUI: [1,8,9,12,16,49]
+};
+// Cidades por loja
+const CD107_CIDADES = {
+  1:"Passo Fundo",2:"Passo Fundo",5:"Passo Fundo",8:"Passo Fundo",9:"Passo Fundo",
+  12:"Ijuí",16:"Santa Cruz do Sul",18:"Cruz Alta",19:"Maraú",20:"Passo Fundo",
+  21:"Ijuí",22:"POA - Assis Brasil",23:"Caxias do Sul",24:"Santa Cruz do Sul",
+  26:"Guaíba",27:"Lagoa Vermelha",28:"Cachoeira",30:"Lages",31:"Tramandaí",
+  32:"São Gabriel",33:"Uruguaiana",34:"Esteio",35:"Caxias do Sul",36:"Torres",
+  37:"Maraú",38:"Soledade",39:"POA - Manoel Elias",40:"Santa Maria",
+  41:"Alegrete",42:"Alvorada",43:"Venâncio Aires",44:"São Borja",45:"Cruz Alta",
+  46:"Sarandi",47:"São Leopoldo",48:"Novo Hamburgo",49:"POA - Ipiranga",
+  50:"Passo Fundo",51:"Caxias do Sul",52:"Caxias do Sul",53:"Santa Maria",
+  54:"Canoas",55:"Pelotas",56:"Lajeado",57:"Imbé",58:"Erechim",59:"Pelotas",
+  62:"—",63:"Viamão",65:"Rio Grande",70:"Vacaria",75:"Canoas",80:"Passo Fundo",
+  85:"Gravataí",90:"Santa Rosa",95:"Capão da Canoa"
+};
+
+// JS getDay(): 0=DOM,1=SEG,2=TER,3=QUA,4=QUI,5=SEX,6=SAB
+// SEX(5)→QUI, SAB(6)→QUI (agenda anterior)
+const JSDAY_TO_SLOT = { 0:"DOM", 1:"SEG", 2:"TER", 3:"QUA", 4:"QUI", 5:"QUI", 6:"QUI" };
+
+// Build reverse map: loja → [slots where it appears]
+const _LOJA_SLOTS = {};
+for (const [slot, lojas] of Object.entries(CD107_SLOTS)) {
+  for (const l of lojas) {
+    if (!_LOJA_SLOTS[l]) _LOJA_SLOTS[l] = [];
+    _LOJA_SLOTS[l].push(slot);
+  }
+}
+
+/**
+ * Given a loja number and a date string "DD/MM/YYYY",
+ * returns the correct agenda slot (DOM/SEG/TER/QUA/QUI).
+ * If loja appears in multiple slots, picks the one matching the date's weekday.
+ * Falls back to the first slot in the loja's list.
+ */
+function diaFromLojaEData(loja, dateStr) {
+  const slots = _LOJA_SLOTS[loja];
+  if (!slots || !slots.length) return '?';
+  if (slots.length === 1) return slots[0];
+  // Parse date DD/MM/YYYY
+  const parts = String(dateStr||'').split('/');
+  if (parts.length < 3) return slots[0];
+  const jsDate = new Date(parseInt(parts[2]), parseInt(parts[1])-1, parseInt(parts[0]));
+  const slotFromDate = JSDAY_TO_SLOT[jsDate.getDay()];
+  if (slots.includes(slotFromDate)) return slotFromDate;
+  // Fallback: return the slot that is closest/earlier in the week
+  return slots[0];
+}
+
+function lojaFromTipEspecie(v) {
+  const s = String(v || '').trim();
+  const m = s.match(/^[Ss](\d+)$/);
+  return m ? parseInt(m[1]) : null;
+}
+
+
 function parseVelox(wb){
   const ws = wb.Sheets[wb.SheetNames[0]];
   const matrix = XLSX.utils.sheet_to_json(ws, {header:1, defval:''});
@@ -692,7 +761,7 @@ function parseVelox(wb){
   }
 
   let headerRow = -1;
-  let idxDate = -1, idxCode = -1, idxDesc = -1, idxEmb = -1;
+  let idxDate = -1, idxCode = -1, idxDesc = -1, idxEmb = -1, idxTip = -1, idxPtl = -1, idxPSt = -1;
 
   for (let i = 0; i < Math.min(matrix.length, 20); i++) {
     const rowRaw = matrix[i] || [];
@@ -704,12 +773,18 @@ function parseVelox(wb){
     let candCode = headers.findIndex(h => h === 'Código do produto');
     let candDesc = headers.findIndex(h => h === 'Produto');
     let candEmb  = headers.findIndex(h => String(h).toLowerCase() === 'embalagem');
+    let candTip  = headers.findIndex(h => h === 'tipEspecie');
+    let candPtl  = headers.findIndex(h => h === '(Palete)Posição');
+    let candPSt  = headers.findIndex(h => h === '(Palete)Status');
 
     // 2) fallback normalizado
     if (candDate < 0) candDate = headersNorm.findIndex(h => h.includes('INTEGRADO') || h === 'DATA' || h === 'DATA_INTEGRADO');
     if (candCode < 0) candCode = headersNorm.findIndex(h => h === 'CODIGO_DO_PRODUTO' || h === 'CODIGO_PRODUTO' || h === 'SEQPRODUTO' || h === 'CODIGO');
     if (candDesc < 0) candDesc = headersNorm.findIndex(h => h === 'PRODUTO' || h === 'DESCRICAO');
     if (candEmb  < 0) candEmb  = headersNorm.findIndex(h => h === 'EMBALAGEM' || h === 'EMB');
+    if (candTip  < 0) candTip  = headersNorm.findIndex(h => h === 'TIPESPECIE' || h === 'TIP_ESPECIE');
+    if (candPtl  < 0) candPtl  = headersNorm.findIndex(h => h.includes('PALETE') && h.includes('POSI'));
+    if (candPSt  < 0) candPSt  = headersNorm.findIndex(h => h.includes('PALETE') && h.includes('STATUS'));
 
     // 3) validação olhando a próxima linha de dados
     const nextRow = matrix[i+1] || [];
@@ -718,10 +793,8 @@ function parseVelox(wb){
 
     if (candDate >= 0 && candCode >= 0 && (dateOk || codeOk || i === 0)) {
       headerRow = i;
-      idxDate = candDate;
-      idxCode = candCode;
-      idxDesc = candDesc;
-      idxEmb = candEmb;
+      idxDate = candDate; idxCode = candCode; idxDesc = candDesc; idxEmb = candEmb;
+      idxTip = candTip; idxPtl = candPtl; idxPSt = candPSt;
       console.log('VELOX cabeçalho bruto:', headers);
       console.log('VELOX cabeçalho normalizado:', headersNorm);
       break;
@@ -745,13 +818,22 @@ function parseVelox(wb){
     const codigo = String(row[idxCode] ?? '').trim();
     if (!date || !codigo) continue;
 
-    const produto = idxDesc >= 0 ? cleanText(row[idxDesc] ?? '') : '';
-    const embalagem = idxEmb >= 0 ? cleanText(row[idxEmb] ?? '') : '';
-    const key = `${codigo}||${embalagem}`;
+    const produto   = idxDesc >= 0 ? cleanText(row[idxDesc] ?? '') : '';
+    const embalagem = idxEmb  >= 0 ? cleanText(row[idxEmb]  ?? '') : '';
+
+    // PTL + Loja via tipEspecie
+    const tipRaw  = idxTip >= 0 ? String(row[idxTip] ?? '').trim() : '';
+    const loja    = lojaFromTipEspecie(tipRaw);
+    const ptl     = idxPtl >= 0 ? String(row[idxPtl] ?? '').trim() : '';
+    const pStatus = idxPSt >= 0 ? String(row[idxPSt] ?? '').trim() : '';
+    const dia     = loja ? diaFromLojaEData(loja, date) : null;
+    const cidade  = loja ? (CD107_CIDADES[loja] || '—') : null;
+
+    const key = `${codigo}||${embalagem}||${loja||''}||${ptl}`;
 
     if (!days[date]) days[date] = {};
     if (!days[date][key]) {
-      days[date][key] = { codigo, produto, embalagem, qtd: 0, origem: 'Velox' };
+      days[date][key] = { codigo, produto, embalagem, qtd: 0, origem: 'Velox', loja, ptl, pStatus, dia, cidade };
     }
     days[date][key].qtd += 1;
   }
@@ -1007,15 +1089,25 @@ async function buildExcelWithExcelJS(type, days, addrMap){
   function addDaySheet(date){
     const ws = wb.addWorksheet(date.replace(/\//g,'-'));
     setupSheet(ws, 2);
+
+    // Column widths matching the image layout
     ws.columns = type === 'stage'
-      ? [{width:12},{width:22},{width:46},{width:12},{width:10},{width:18},{width:16}]
-      : [{width:12},{width:22},{width:46},{width:12},{width:10},{width:22},{width:16}];
+      ? [{width:12},{width:22},{width:48},{width:8},{width:7},{width:22},{width:12}]
+      : [{width:12},{width:22},{width:48},{width:8},{width:7},{width:22},{width:12}];
 
-    ws.mergeCells(type === 'stage' ? 'A1:G1' : 'A1:G1');
-    ws.getCell('A1').value = (type === 'stage' ? 'STAGE-IN' : 'VELOX') + ` — Pendências  ${date}  (${dowFull(date)})`;
-    setCell(ws.getCell('A1'), {bg:theme.navy, fg:theme.white, bold:true, size:12, align:'center'});
-    ws.getRow(1).height = 24;
+    const ncols = 7;
+    const lastCol = 'G';
 
+    // ── Row 1: Title ─────────────────────────────────────────────────────────
+    ws.mergeCells(`A1:${lastCol}1`);
+    const titleType = type === 'stage' ? 'STAGE-IN' : 'VELOX';
+    ws.getCell('A1').value = `${titleType} — Pendências  ${date}  (${dowFull(date)})`;
+    ws.getCell('A1').font   = {name:'Calibri', size:13, bold:true, color:{argb:theme.white}};
+    ws.getCell('A1').fill   = {type:'pattern', pattern:'solid', fgColor:{argb:theme.navy}};
+    ws.getCell('A1').alignment = {vertical:'middle', horizontal:'center'};
+    ws.getRow(1).height = 26;
+
+    // ── Row 2: Column headers ─────────────────────────────────────────────────
     const headers = type === 'stage'
       ? ['Código','Endereço','Produto','Emb','Qtd','Stage-IN','Origem']
       : ['Código','Endereço','Produto','Emb','Qtd','Endereço','Origem'];
@@ -1023,37 +1115,66 @@ async function buildExcelWithExcelJS(type, days, addrMap){
     headers.forEach((h, i) => {
       const c = ws.getRow(2).getCell(i+1);
       c.value = h;
-      setCell(c, {bg:theme.navy, fg:theme.white, bold:true, size:10});
+      c.font      = {name:'Calibri', size:11, bold:true, color:{argb:theme.white}};
+      c.fill      = {type:'pattern', pattern:'solid', fgColor:{argb:'FF1E3A5F'}};
+      c.alignment = {vertical:'middle', horizontal:'center'};
+      c.border    = {
+        top:   {style:'thin', color:{argb:'FF2E5F8A'}},
+        bottom:{style:'medium',color:{argb:'FF2E5F8A'}},
+        left:  {style:'thin', color:{argb:'FF2E5F8A'}},
+        right: {style:'thin', color:{argb:'FF2E5F8A'}}
+      };
     });
-    ws.getRow(2).height = 18;
+    ws.getRow(2).height = 22;
 
-    const rows = type === 'stage'
+    // ── Data rows ─────────────────────────────────────────────────────────────
+    const rowData = type === 'stage'
       ? stageItemRows(days[date]).map(r => [r.CODIGO, normalizeExportAddress(r.ENDERECO_APANHA), r.DESCRICAO, r.EMBALAGEM, r.QUANTIDADE, r.STAGEIN, r.ORIGEM])
       : veloxItemRows(days[date], addrMap).map(r => [r.CODIGO, normalizeExportAddress(r.ENDERECO), r.DESCRICAO, r.EMBALAGEM, r.QUANTIDADE, normalizeExportAddress(r.ENDERECO), r.ORIGEM]);
 
-    rows.forEach((vals, i) => {
+    // Alternating: white and very light blue (matches screenshot)
+    const ALT_WHITE = 'FFFFFFFF';
+    const ALT_BLUE  = 'FFE8F1FB';
+    const BORDER_DATA = {
+      top:   {style:'thin', color:{argb:'FFD0DCE8'}},
+      bottom:{style:'thin', color:{argb:'FFD0DCE8'}},
+      left:  {style:'thin', color:{argb:'FFD0DCE8'}},
+      right: {style:'thin', color:{argb:'FFD0DCE8'}}
+    };
+
+    rowData.forEach((vals, i) => {
       const rowNum = i + 3;
-      const bg = i % 2 === 0 ? theme.alt1 : theme.alt2;
+      const bg = i % 2 === 0 ? ALT_WHITE : ALT_BLUE;
       vals.forEach((v, cidx) => {
         const c = ws.getRow(rowNum).getCell(cidx+1);
         c.value = v;
-        setCell(c, {bg, fg:theme.text, size:11, align:cidx===2?'left':'center'});
+        c.font      = {name:'Calibri', size:11, color:{argb:'FF1F2937'}};
+        c.fill      = {type:'pattern', pattern:'solid', fgColor:{argb:bg}};
+        // Produto (col 3) left-aligned; all others centered
+        c.alignment = {vertical:'middle', horizontal: cidx===2 ? 'left' : 'center'};
+        c.border    = BORDER_DATA;
       });
       ws.getRow(rowNum).height = 18;
     });
 
-    const totalRow = rows.length + 3;
+    // ── Total row ─────────────────────────────────────────────────────────────
+    const totalRow = rowData.length + 3;
     ws.mergeCells(`A${totalRow}:D${totalRow}`);
     ws.getCell(`A${totalRow}`).value = 'TOTAL';
-    setCell(ws.getCell(`A${totalRow}`), {bg:theme.navy, fg:theme.white, bold:true, size:10, align:'right'});
-    const qtdCell = ws.getCell(`E${totalRow}`);
-    qtdCell.value = rows.reduce((s, r) => s + Number(r[4] || 0), 0);
-    setCell(qtdCell, {bg:theme.navy, fg:theme.white, bold:true, size:10});
-    for (const col of ['F','G']){
+    ws.getCell(`A${totalRow}`).font  = {name:'Calibri', size:11, bold:true, color:{argb:theme.white}};
+    ws.getCell(`A${totalRow}`).fill  = {type:'pattern', pattern:'solid', fgColor:{argb:theme.navy}};
+    ws.getCell(`A${totalRow}`).alignment = {vertical:'middle', horizontal:'right'};
+    ws.getCell(`A${totalRow}`).border = borderAll();
+
+    const qtdTotal = rowData.reduce((s, r) => s + Number(r[4]||0), 0);
+    ['E','F','G'].forEach((col, ci) => {
       const c = ws.getCell(`${col}${totalRow}`);
-      c.value = '';
-      setCell(c, {bg:theme.navy, fg:theme.white, bold:true, size:10});
-    }
+      c.value = ci===0 ? qtdTotal : '';
+      c.font  = {name:'Calibri', size:11, bold:true, color:{argb:theme.white}};
+      c.fill  = {type:'pattern', pattern:'solid', fgColor:{argb:theme.navy}};
+      c.alignment = {vertical:'middle', horizontal:'center'};
+      c.border = borderAll();
+    });
     ws.getRow(totalRow).height = 20;
   }
 
@@ -1365,6 +1486,167 @@ window.renderSummary = function(veloxDays, stageDays){
 };
 
 
+// ── Gera Excel separado: Pendências × PTL × Agenda ─────────────────────────
+async function buildExcelPendenciasPTL(veloxDays) {
+  // Sanitize Excel sheet name: remove forbidden chars, max 31 chars
+  function safeSheet(name) {
+    return String(name||'SEM_DIA').replace(/[:\\\/?*\[\]]/g,'').replace(/^'|'$/g,'').trim().substring(0,31) || 'SEM_DIA';
+  }
+  const DIA_ORD  = { DOM:1, SEG:2, TER:3, QUA:4, QUI:5 };
+  const DIA_ARGB = { DOM:'FFC6EFCE', SEG:'FFFFEB9C', TER:'FFBDD7EE', QUA:'FFFCE4D6', QUI:'FFE2EFDA' };
+  const DIA_BORD = { DOM:'FF375623', SEG:'FF9C5700', TER:'FF1F4E79', QUA:'FF833C00', QUI:'FF375623' };
+
+  // Collect items that have loja (came from tipEspecie)
+  const allItems = [];
+  for (const [date, items] of Object.entries(veloxDays)) {
+    for (const item of items) {
+      allItems.push({ ...item, date });
+    }
+  }
+  if (!allItems.length) return null;
+
+  // Sort by date → loja → ptl (abas por data de pendência)
+  allItems.sort((a,b) => {
+    const cmpDate = sortBRDates([a.date, b.date]);
+    if (a.date !== b.date) return cmpDate[0]===a.date ? -1 : 1;
+    return (a.loja||0)-(b.loja||0) || (a.ptl||'').localeCompare(b.ptl||'');
+  });
+
+  // Group by data real da pendência (DD/MM/YYYY)
+  const byDate = {};
+  for (const item of allItems) {
+    const d = item.date || 'SEM_DATA';
+    if (!byDate[d]) byDate[d] = []; byDate[d].push(item);
+  }
+  const sortedDates = sortBRDates(Object.keys(byDate));
+
+  const ALT_WHITE = 'FFFFFFFF';
+  const ALT_BLUE  = 'FFE8F1FB';
+  const COLS_ALL = [{width:11},{width:13},{width:7},{width:24},{width:12},{width:10},{width:6},{width:50},{width:7}];
+  const COLS_DAY = [{width:11},{width:7},{width:24},{width:12},{width:10},{width:6},{width:50},{width:7}];
+  const HDR_ALL  = ['Dia Agenda','Data','Loja','Cidade','PTL','Código','Emb','Produto','Qtde'];
+  const HDR_DAY  = ['Dia Agenda','Loja','Cidade','PTL','Código','Emb','Produto','Qtde'];
+  const NAVY = 'FF1E3A5F';
+  const LINE = 'FFD0DCE8';
+
+  function ptlBorder(argb){ return {top:{style:'thin',color:{argb}},bottom:{style:'thin',color:{argb}},left:{style:'thin',color:{argb}},right:{style:'thin',color:{argb}}}; }
+
+  if (useExcelJS) {
+    try {
+      const wb2 = new ExcelJS.Workbook();
+
+      // ── Aba geral (todos os itens, todas as datas) ────────────────────────
+      const wsAll = wb2.addWorksheet(safeSheet('Pendencias PTL'));
+      wsAll.views = [{state:'frozen', ySplit:3, showGridLines:false}];
+      wsAll.columns = COLS_ALL;
+      wsAll.mergeCells('A1:I1');
+      const t1 = wsAll.getCell('A1');
+      t1.value = 'PENDÊNCIAS × PTL × AGENDA DE SEPARAÇÃO — CD 107';
+      t1.font = {name:'Calibri',size:13,bold:true,color:{argb:'FFFFFFFF'}};
+      t1.fill = {type:'pattern',pattern:'solid',fgColor:{argb:NAVY}};
+      t1.alignment = {horizontal:'center',vertical:'middle'};
+      wsAll.getRow(1).height = 26;
+      wsAll.mergeCells('A2:I2');
+      const t2 = wsAll.getCell('A2');
+      t2.value = 'Gerado em: ' + new Date().toLocaleString('pt-BR') + '  |  ' + allItems.length + ' itens';
+      t2.font = {name:'Calibri',size:9,color:{argb:'FF64748B'}};
+      t2.alignment = {horizontal:'center'};
+      wsAll.getRow(2).height = 13;
+      HDR_ALL.forEach((h,i) => {
+        const c = wsAll.getRow(3).getCell(i+1);
+        c.value = h; c.font = {name:'Calibri',size:11,bold:true,color:{argb:'FFFFFFFF'}};
+        c.fill = {type:'pattern',pattern:'solid',fgColor:{argb:NAVY}};
+        c.alignment = {horizontal:'center',vertical:'middle'};
+        c.border = ptlBorder('FF2E5F8A');
+      });
+      wsAll.getRow(3).height = 20;
+      allItems.forEach((item, idx) => {
+        const rn = idx + 4;
+        const bg = idx%2===0 ? ALT_WHITE : ALT_BLUE;
+        const dia = item.dia||'?';
+        [dia, item.date, item.loja, item.cidade||'', item.ptl||'', item.codigo||'', item.embalagem||'', item.produto||'', item.qtd].forEach((v,ci) => {
+          const c = wsAll.getRow(rn).getCell(ci+1);
+          c.value = v; c.font = {name:'Calibri',size:10,color:{argb:'FF1F2937'}};
+          c.fill = {type:'pattern',pattern:'solid',fgColor:{argb:bg}};
+          c.alignment = {horizontal:(ci===3||ci===7)?'left':'center', vertical:'middle'};
+          c.border = ptlBorder(LINE);
+        });
+        wsAll.getRow(rn).height = 17;
+      });
+
+      // ── Abas por data de pendência ────────────────────────────────────────
+      for (const date of sortedDates) {
+        const items = byDate[date];
+        const sheetName = safeSheet(date.replace(/\//g,'-'));
+        const ws = wb2.addWorksheet(sheetName);
+        ws.views = [{state:'frozen', ySplit:2, showGridLines:false}];
+        ws.columns = COLS_DAY;
+        // Title: same style as velox report
+        ws.mergeCells('A1:H1');
+        const th = ws.getCell('A1');
+        th.value = `VELOX — Pendências PTL  ${date}`;
+        th.font = {name:'Calibri',size:13,bold:true,color:{argb:'FFFFFFFF'}};
+        th.fill = {type:'pattern',pattern:'solid',fgColor:{argb:NAVY}};
+        th.alignment = {horizontal:'center',vertical:'middle'};
+        ws.getRow(1).height = 26;
+        // Column headers
+        HDR_DAY.forEach((h,i) => {
+          const c = ws.getRow(2).getCell(i+1);
+          c.value = h; c.font = {name:'Calibri',size:11,bold:true,color:{argb:'FFFFFFFF'}};
+          c.fill = {type:'pattern',pattern:'solid',fgColor:{argb:'FF1E3A5F'}};
+          c.alignment = {horizontal:'center',vertical:'middle'};
+          c.border = {top:{style:'thin',color:{argb:'FF2E5F8A'}},bottom:{style:'medium',color:{argb:'FF2E5F8A'}},left:{style:'thin',color:{argb:'FF2E5F8A'}},right:{style:'thin',color:{argb:'FF2E5F8A'}}};
+        });
+        ws.getRow(2).height = 22;
+        // Data rows
+        items.forEach((item, idx) => {
+          const rn = idx + 3;
+          const bg = idx%2===0 ? ALT_WHITE : ALT_BLUE;
+          const dia = item.dia||'?';
+          [dia, item.loja, item.cidade||'', item.ptl||'', item.codigo||'', item.embalagem||'', item.produto||'', item.qtd].forEach((v,ci) => {
+            const c = ws.getRow(rn).getCell(ci+1);
+            c.value = v; c.font = {name:'Calibri',size:11,color:{argb:'FF1F2937'}};
+            c.fill = {type:'pattern',pattern:'solid',fgColor:{argb:bg}};
+            c.alignment = {horizontal:(ci===2||ci===6)?'left':'center', vertical:'middle'};
+            c.border = ptlBorder(LINE);
+          });
+          ws.getRow(rn).height = 17;
+        });
+        // Total row
+        const totalRow = items.length + 3;
+        ws.mergeCells(`A${totalRow}:G${totalRow}`);
+        ws.getCell(`A${totalRow}`).value = 'TOTAL  ' + items.length + ' itens';
+        ws.getCell(`A${totalRow}`).font = {name:'Calibri',size:11,bold:true,color:{argb:'FFFFFFFF'}};
+        ws.getCell(`A${totalRow}`).fill = {type:'pattern',pattern:'solid',fgColor:{argb:NAVY}};
+        ws.getCell(`A${totalRow}`).alignment = {horizontal:'right',vertical:'middle'};
+        const tcQtd = ws.getCell(`H${totalRow}`);
+        tcQtd.value = items.reduce((s,i)=>s+Number(i.qtd||0),0);
+        tcQtd.font = {name:'Calibri',size:11,bold:true,color:{argb:'FFFFFFFF'}};
+        tcQtd.fill = {type:'pattern',pattern:'solid',fgColor:{argb:NAVY}};
+        tcQtd.alignment = {horizontal:'center',vertical:'middle'};
+        ws.getRow(totalRow).height = 20;
+      }
+
+      const buffer = await wb2.xlsx.writeBuffer();
+      return new Blob([buffer], {type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+    } catch(e) { console.warn('ExcelJS PTL falhou, SheetJS fallback:', e); }
+  }
+
+  // SheetJS fallback — grouping by date
+  const wbFb = XLSX.utils.book_new();
+  const aoaAll = [HDR_ALL];
+  for (const item of allItems) aoaAll.push([item.dia||'?', item.date, item.loja, item.cidade||'', item.ptl||'', item.codigo||'', item.embalagem||'', item.produto||'', item.qtd]);
+  XLSX.utils.book_append_sheet(wbFb, XLSX.utils.aoa_to_sheet(aoaAll), 'Pendencias PTL');
+  for (const date of sortedDates) {
+    const aoa = [HDR_DAY];
+    for (const item of byDate[date]) aoa.push([item.dia||'?', item.loja, item.cidade||'', item.ptl||'', item.codigo||'', item.embalagem||'', item.produto||'', item.qtd]);
+    XLSX.utils.book_append_sheet(wbFb, XLSX.utils.aoa_to_sheet(aoa), safeSheet(date.replace(/\//g,'-')));
+  }
+  const out = XLSX.write(wbFb, {bookType:'xlsx', type:'array'});
+  return new Blob([out], {type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+}
+
+
 async function run(){
   const btn = document.getElementById('btn');
   if (!state.velox || !state.stage || !state.ruas) {
@@ -1421,6 +1703,15 @@ async function run(){
       if (stageDates.length) blobStage = buildExcelWithSheetJS('stage', stageDays, addrMap);
     }
 
+    setP(82, 'Gerando pendências PTL + Agenda...');
+    let blobPTL = null;
+    try {
+      blobPTL = await buildExcelPendenciasPTL(veloxDays);
+      if (blobPTL) addLog('Pendências PTL × Agenda geradas.', 'ok');
+    } catch(ePTL) {
+      addLog('Aviso PTL: ' + ePTL.message, 'warn');
+    }
+
     setP(88, 'Gerando imagem de resumo...');
     const imgData = buildImage(veloxDays, stageDays);
     window.renderSummary(veloxDays, stageDays);
@@ -1433,6 +1724,7 @@ async function run(){
     grid.className = 'dl-grid';
     addDownload(grid, blobVelox, 'pendencias_com_endereco.xlsx', '📊', 'pendencias_com_endereco.xlsx', `${veloxDates.length} abas · ${veloxVol.toLocaleString('pt-BR')} volumes`);
     if (blobStage) addDownload(grid, blobStage, 'stage_in_pendencias.xlsx', '📦', 'stage_in_pendencias.xlsx', `${stageDates.length} abas · ${stageVol.toLocaleString('pt-BR')} volumes`);
+    if (blobPTL) addDownload(grid, blobPTL, 'pendencias_ptl_agenda.xlsx', '🗂️', 'pendencias_ptl_agenda.xlsx', 'Pendências × PTL × Agenda — por dia de escala');
     dlBox.appendChild(grid);
     dlBox.insertAdjacentHTML('beforeend', '<div class="dl-lbl" style="margin-top:10px">↓ Imagem para compartilhar</div>');
     addImageDownload(dlBox, imgData, 'resumo_stage_in.png');
